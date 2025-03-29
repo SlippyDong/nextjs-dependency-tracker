@@ -1,0 +1,28 @@
+// tsconfig.json
+{
+	"compilerOptions": {
+		"module": "Node16",
+		"target": "ES2022",
+		"lib": [
+			"ES2022"
+		],
+		"sourceMap": true,
+		"rootDir": "src",
+		"strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+		/* Additional Checks */
+		// "noImplicitReturns": true,
+		// "noFallthroughCasesInSwitch": true,
+		// "noUnusedParameters": true,
+	},
+    "include": [
+        "src/**/*"
+    ],
+    "exclude": [
+        "node_modules",
+        ".vscode-test",
+        "dist",
+        "out"
+    ]
+}

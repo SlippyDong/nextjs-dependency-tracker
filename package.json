@@ -1,0 +1,87 @@
+{
+  "name": "nextjs-dependency-tracker",
+  "displayName": "next.js Dependency Tracker",
+  "description": "Tracks dependencies, exports, routes, and interfaces in Next.js/TS/JS projects.",
+  "version": "0.0.1",
+  "publisher": "SlippyDong",
+  "engines": {
+    "vscode": "^1.98.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "next-dependency-tracker.updateDependencies",
+        "title": "Dependency Tracker: Scan Project and Update Reports"
+      }
+    ],
+    "configuration": {
+      "title": "Next.js Dependency Tracker",
+      "properties": {
+        "nextjs-dependency-tracker.enablePolling": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable automatic background polling to update dependency reports periodically (independent of saves)."
+        },
+        "nextjs-dependency-tracker.pollingIntervalSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "description": "Interval (in seconds) for automatic background polling (if enabled)."
+        },
+        "nextjs-dependency-tracker.excludedFolders": {
+          "type": "array",
+          "default": [
+            "node_modules",
+            ".next",
+            ".git",
+            "dist",
+            "out",
+            ".vscode",
+            ".cursor",
+            ".vibesync",
+            ".dependencies"
+          ],
+          "description": "Folders to exclude from analysis (relative to workspace root)."
+        },
+        "nextjs-dependency-tracker.debounceDelayMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 500,
+          "description": "Delay (in milliseconds) after a file save before triggering analysis."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "20.x",
+    "@typescript-eslint/eslint-plugin": "^8.28.0",
+    "@typescript-eslint/parser": "^8.28.0",
+    "eslint": "^9.23.0",
+    "typescript": "^5.8.2",
+    "ts-loader": "^9.5.2",
+    "webpack": "^5.98.0",
+    "webpack-cli": "^6.0.1",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.4.1"
+  }
+}
