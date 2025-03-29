@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as ts from 'typescript'; // Import the typescript library itself
 import { findProjectFiles } from './fileFinder';
 import { parseProject } from './parser';
-import { AnalysisResult, ExportInfo, UsageInfo, InterfaceInfo, RouteInfo, MissingImportInfo, ImportInfo } from './types';
+import { AnalysisResult, ExportInfo, UsageInfo, InterfaceInfo, RouteInfo, MissingImportInfo, ImportInfo, ServerActionInfo, HookInfo, DynamicUsageInfo } from './types';
 import { log, logError, getWorkspacePath, relativePath } from './utils';
 
 const OUTPUT_DIR_NAME = '.dependencies';
@@ -19,6 +19,9 @@ interface TsConfigPaths {
 
 let cachedTsConfigPaths: TsConfigPaths | null = null;
 let tsConfigReadAttempted = false;
+
+// Add at the top with other cache variables
+const moduleResolutionCache = new Map<string, { resolvedPath?: string; error?: string }>();
 
 /** Ensures the output directory exists. */
 async function ensureOutputDir(workspacePath: string): Promise<string | null> {
@@ -111,6 +114,15 @@ export function clearTsConfigCache() {
     tsConfigReadAttempted = false;
 }
 
+// Add this helper function for consistent path normalization
+function normalizePath(inputPath: string, workspacePath: string): string {
+    // Handle relative vs absolute paths consistently
+    if (path.isAbsolute(inputPath)) {
+        return path.normalize(inputPath);
+    } else {
+        return path.normalize(path.join(workspacePath, inputPath));
+    }
+}
 
 /** Tries to resolve a module path, supporting tsconfig paths and manual TS/TSX checks. */
 function resolveModulePath(
@@ -118,6 +130,14 @@ function resolveModulePath(
     importerPath: string,
     workspacePath: string
 ): { resolvedPath?: string; error?: string } {
+    // Create cache key from inputs
+    const cacheKey = `${sourceModule}|${importerPath}|${workspacePath}`;
+    
+    // Check cache first
+    const cached = moduleResolutionCache.get(cacheKey);
+    if (cached) {
+        return cached;
+    }
 
     const allowedExts = ['.ts', '.tsx', '.js', '.jsx']; // Extensions we check
 
@@ -264,6 +284,9 @@ function analyzeDependencies(
     allInterfaces: InterfaceInfo[],
     allPotentialUsage: { name: string; usage: UsageInfo }[],
     routes: RouteInfo[],
+    serverActions: ServerActionInfo[],
+    hooks: HookInfo[],
+    dynamicUsages: DynamicUsageInfo[],
     workspacePath: string
 ): AnalysisResult {
     const analysisStartTime = Date.now();
@@ -372,6 +395,227 @@ function analyzeDependencies(
             }
         }
     });
+    
+    // 3.1 Mark all route handlers as used since they're framework-specific exports
+    routes.forEach(route => {
+        if (route.exportedMethods && route.exportedMethods.length > 0) {
+            // Important: Use route handler methods to find related exports
+            for (const [filePath, exports] of exportsByFile.entries()) {
+                // Check if this file could be our route handler file
+                if (filePath.includes(route.filePath) || route.filePath.includes(path.basename(filePath))) {
+                    log(`Checking file for route handlers: ${filePath}`);
+                    
+                    // Look for exports that match HTTP methods
+                    exports.forEach(exp => {
+                        if (route.exportedMethods!.includes(exp.name)) {
+                            log(`Found route handler export: ${exp.name} in ${filePath}`);
+                            
+                            // Get the unique key for this export
+                            const uniqueKey = `${path.normalize(exp.filePath)}|${exp.name}|${exp.isDefault}`;
+                            const exportEntry = exportsMap.get(uniqueKey);
+                            
+                            if (exportEntry) {
+                                // Mark as used by the framework
+                                exportEntry.usedIn.push({
+                                    filePath: "next.js-framework",
+                                    line: 0
+                                });
+                                
+                                log(`Marked route handler '${exp.name}' as used`);
+                                
+                                // Also add explicit fetch usages if available
+                                const routeUsages = route.usedIn || [];
+                                routeUsages.forEach(usage => {
+                                    if (usage.method === exp.name || !usage.method) {
+                                        exportEntry.usedIn.push({
+                                            filePath: usage.sourceFile,
+                                            line: usage.line
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+    
+    // 3.2 Mark server action exports as used
+    serverActions.forEach(action => {
+        const actionFilePath = path.normalize(action.filePath);
+        const actionExports = exportsByFile.get(actionFilePath);
+        
+        if (actionExports) {
+            for (const exp of actionExports) {
+                if (exp.name === action.name) {
+                    const uniqueKey = `${actionFilePath}|${exp.name}|${exp.isDefault}`;
+                    const exportEntry = exportsMap.get(uniqueKey);
+                    
+                    if (exportEntry) {
+                        // Mark as used by the framework, regardless of detected usage
+                        exportEntry.usedIn.push({
+                            filePath: "next.js-framework",
+                            line: 0
+                        });
+                        
+                        log(`Marked server action '${exp.name}' as used by framework`);
+                        
+                        // Also add any explicit usages if available
+                        const actionUsages = action.usedIn || [];
+                        actionUsages.forEach(usage => {
+                            exportEntry.usedIn.push({
+                                filePath: usage.sourceFile,
+                                line: usage.line
+                            });
+                        });
+                    }
+                }
+            }
+        }
+    });
+    
+    // 3.3 Mark hook exports as used
+    hooks.forEach(hook => {
+        const hookFilePath = path.normalize(hook.filePath);
+        const hookExports = exportsByFile.get(hookFilePath);
+        
+        if (hookExports) {
+            for (const exp of hookExports) {
+                if (exp.name === hook.name) {
+                    const uniqueKey = `${hookFilePath}|${exp.name}|${exp.isDefault}`;
+                    const exportEntry = exportsMap.get(uniqueKey);
+                    
+                    if (exportEntry) {
+                        // For hooks, we don't mark all as used by default since they do need explicit usage
+                        // But we'll still track any explicit usages
+                        const hookUsages = hook.usedIn || [];
+                        if (hookUsages.length > 0) {
+                            hookUsages.forEach(usage => {
+                                exportEntry.usedIn.push({
+                                    filePath: usage.sourceFile,
+                                    line: usage.line
+                                });
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 3.4 Mark Next.js page components as used by the framework
+    log(`Marking Next.js page components as used by the framework...`);
+    for (const [filePath, exports] of exportsByFile.entries()) {
+        // Check if this file could be a Next.js page component
+        if (filePath.includes('/page.') || filePath.includes('\\page.')) {
+            log(`Found potential page component file: ${filePath}`);
+            
+            // Look for default exports in page files
+            exports.forEach(exp => {
+                if (exp.isDefault) {
+                    log(`Found default export in page file: ${exp.name} in ${filePath}`);
+                    
+                    // Get the unique key for this export
+                    const uniqueKey = `${path.normalize(exp.filePath)}|${exp.name}|${exp.isDefault}`;
+                    const exportEntry = exportsMap.get(uniqueKey);
+                    
+                    if (exportEntry) {
+                        // Mark as used by the framework
+                        exportEntry.usedIn.push({
+                            filePath: "next.js-framework",
+                            line: 0
+                        });
+                        
+                        log(`Marked page component '${exp.name}' as used by framework`);
+                    }
+                }
+            });
+        }
+    }
+
+    // 3.5 Mark Next.js layout components as used by the framework
+    log(`Marking Next.js layout components as used by the framework...`);
+    for (const [filePath, exports] of exportsByFile.entries()) {
+        // Check if this file could be a Next.js layout component
+        if (filePath.includes('/layout.') || filePath.includes('\\layout.')) {
+            log(`Found potential layout component file: ${filePath}`);
+            
+            // Look for default exports in layout files
+            exports.forEach(exp => {
+                if (exp.isDefault) {
+                    log(`Found default export in layout file: ${exp.name} in ${filePath}`);
+                    
+                    // Get the unique key for this export
+                    const uniqueKey = `${path.normalize(exp.filePath)}|${exp.name}|${exp.isDefault}`;
+                    const exportEntry = exportsMap.get(uniqueKey);
+                    
+                    if (exportEntry) {
+                        // Mark as used by the framework
+                        exportEntry.usedIn.push({
+                            filePath: "next.js-framework",
+                            line: 0
+                        });
+                        
+                        log(`Marked layout component '${exp.name}' as used by framework`);
+                    }
+                }
+            });
+        }
+    }
+
+    // 3.6 Look for named exports in app directory files that might be Next.js special exports
+    log(`Checking for other special Next.js exports...`);
+    allExports.forEach(exp => {
+        const normalizedPath = path.normalize(exp.filePath);
+        
+        // Special handling for non-default exports in app directory
+        if ((normalizedPath.includes('/app/') || normalizedPath.includes('\\app\\')) &&
+            !exp.isDefault) {
+            
+            // Known Next.js special exports that are implicitly used by the framework
+            const nextJsSpecialExports = [
+                'generateMetadata', 'metadata', 'generateStaticParams', 
+                'revalidate', 'dynamic', 'fetchCache', 'preferredRegion',
+                'generateStaticParams', 'getStaticProps', 'getServerSideProps'
+            ];
+            
+            if (nextJsSpecialExports.includes(exp.name)) {
+                log(`Found Next.js special export: ${exp.name} in ${normalizedPath}`);
+                
+                const uniqueKey = `${normalizedPath}|${exp.name}|${exp.isDefault}`;
+                const exportEntry = exportsMap.get(uniqueKey);
+                
+                if (exportEntry) {
+                    // Mark as used by the framework
+                    exportEntry.usedIn.push({
+                        filePath: "next.js-framework",
+                        line: 0
+                    });
+                    
+                    log(`Marked special export '${exp.name}' as used by framework`);
+                }
+            }
+            
+            // Additional check for 'actions' directory - common pattern for server actions
+            if (normalizedPath.includes('/actions/') || normalizedPath.includes('\\actions\\')) {
+                log(`Found export in actions directory: ${exp.name} in ${normalizedPath}`);
+                
+                const uniqueKey = `${normalizedPath}|${exp.name}|${exp.isDefault}`;
+                const exportEntry = exportsMap.get(uniqueKey);
+                
+                if (exportEntry) {
+                    // Mark as used by the framework
+                    exportEntry.usedIn.push({
+                        filePath: "next.js-framework",
+                        line: 0
+                    });
+                    
+                    log(`Marked action export '${exp.name}' as used by framework`);
+                }
+            }
+        }
+    });
 
     // 4. Determine Used vs. Unused Exports
     const usedExportsMap = new Map<string, ExportInfo & { usedIn: UsageInfo[] }>();
@@ -401,6 +645,9 @@ function analyzeDependencies(
         missingImports: missingImports,
         interfaces: interfacesMap,
         routes: routes,
+        serverActions: serverActions,
+        hooks: hooks,
+        dynamicUsages: dynamicUsages,
         errors: analysisErrors,
     };
 }
@@ -414,24 +661,119 @@ function generateUsedExportsMarkdown(analysisResult: AnalysisResult, workspacePa
         return md;
     }
 
+    // Type for the export with its usage information
+    type UsedExportInfo = ExportInfo & { usedIn: UsageInfo[] };
+    
+    // Group exports by file path
+    const exportsByFile = new Map<string, Map<string, UsedExportInfo[]>>();
+    
+    // Sort the used exports by file path and name
     const sortedUsedExports = Array.from(analysisResult.usedExports.values()).sort((a, b) =>
         a.filePath.localeCompare(b.filePath) || a.name.localeCompare(b.name)
     );
-
-    let currentFile = '';
+    
+    // First pass: Group exports by file
     sortedUsedExports.forEach(exp => {
         const relFilePath = relativePath(exp.filePath, workspacePath);
-        if (exp.filePath !== currentFile) {
-            md += `## File: \`${relFilePath}\`\n`;
-            currentFile = exp.filePath;
+        
+        if (!exportsByFile.has(relFilePath)) {
+            exportsByFile.set(relFilePath, new Map<string, UsedExportInfo[]>());
         }
-        const exportName = exp.isDefault ? `${exp.name} (default${exp.localName ? `: ${exp.localName}`: ''})` : exp.name;
-        md += `### Export: \`${exportName}\` (Line ${exp.line})\n`;
-        exp.usedIn.forEach(usage => {
-            md += `- Used in: \`${relativePath(usage.filePath, workspacePath)}\` (Line ${usage.line})\n`;
-        });
-        md += '\n';
+        
+        // Create a usage key by sorting and concatenating all usage file paths and lines
+        const usageKey = exp.usedIn
+            .map(usage => `${usage.filePath}:${usage.line}`)
+            .sort()
+            .join('|');
+            
+        const fileExports = exportsByFile.get(relFilePath)!;
+        
+        if (!fileExports.has(usageKey)) {
+            fileExports.set(usageKey, []);
+        }
+        
+        fileExports.get(usageKey)!.push(exp);
     });
+    
+    // Second pass: Format markdown
+    const sortedFiles = Array.from(exportsByFile.keys()).sort();
+    
+    sortedFiles.forEach(filePath => {
+        md += `## File: \`${filePath}\`\n`;
+        
+        const fileExports = exportsByFile.get(filePath)!;
+        const usageKeys = Array.from(fileExports.keys());
+        
+        usageKeys.forEach(usageKey => {
+            const exportsWithSameUsage = fileExports.get(usageKey)!;
+            
+            // Check if there are many exports with the same usage pattern
+            const hasManyExports = exportsWithSameUsage.length >= 5;
+            
+            if (hasManyExports) {
+                // For many exports, display in a more compact format
+                // Sort exports by line number
+                exportsWithSameUsage.sort((a, b) => a.line - b.line);
+                
+                // Group exports by their line numbers
+                const exportsByLine = exportsWithSameUsage.reduce((acc, exp) => {
+                    if (!acc[exp.line]) {
+                        acc[exp.line] = [];
+                    }
+                    acc[exp.line].push(exp);
+                    return acc;
+                }, {} as Record<number, UsedExportInfo[]>);
+                
+                // Display exports grouped by line number
+                Object.entries(exportsByLine).forEach(([line, exps]) => {
+                    const exportNames = exps.map(exp => {
+                        const exportName = exp.isDefault ? 
+                            `${exp.name}${exp.localName ? `: ${exp.localName}` : ''}` : 
+                            exp.name;
+                        return `\`${exportName}\``;
+                    }).join(', ');
+                    
+                    md += `${exportNames} (Line ${line})\n`;
+                });
+            } else {
+                // For fewer exports, use the previous format
+                // Sort exports by line number
+                exportsWithSameUsage.sort((a, b) => a.line - b.line);
+                
+                // List all exports with the same usage pattern
+                const exportsList = exportsWithSameUsage.map(exp => {
+                    const exportName = exp.isDefault ? 
+                        `${exp.name}${exp.localName ? `: ${exp.localName}` : ''}` : 
+                        exp.name;
+                    return `\`${exportName}\` (Line ${exp.line})`;
+                }).join('\n');
+                
+                md += `${exportsList}\n`;
+            }
+            
+            // Show usage locations
+            if (exportsWithSameUsage[0].usedIn.length > 0) {
+                // Get unique usage locations
+                const uniqueUsages = new Map<string, UsageInfo>();
+                exportsWithSameUsage[0].usedIn.forEach(usage => {
+                    const usageKey = `${usage.filePath}:${usage.line}`;
+                    if (!uniqueUsages.has(usageKey)) {
+                        uniqueUsages.set(usageKey, usage);
+                    }
+                });
+                
+                const sortedUsages = Array.from(uniqueUsages.values())
+                    .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.line - b.line);
+                
+                sortedUsages.forEach(usage => {
+                    md += `- Used in: \`${relativePath(usage.filePath, workspacePath)}\` (Line ${usage.line})\n`;
+                });
+            }
+            
+            md += '\n';
+        });
+    });
+    
     return md;
 }
 
@@ -442,16 +784,58 @@ function generateUnusedExportsMarkdown(analysisResult: AnalysisResult, workspace
         return md;
     }
 
-    const sortedUnused = analysisResult.unusedExports.sort((a, b) =>
-        a.filePath.localeCompare(b.filePath) || a.line - b.line
-    );
-
-    sortedUnused.forEach(exp => {
+    // Group exports by file path
+    const exportsByFile = new Map<string, { exportInfo: ExportInfo; line: number }[]>();
+    
+    analysisResult.unusedExports.forEach(exp => {
         const relFilePath = relativePath(exp.filePath, workspacePath);
-         const exportName = exp.isDefault ? `${exp.name} (default${exp.localName ? `: ${exp.localName}`: ''})` : exp.name;
-        md += `- \`${relFilePath}\` (Line ${exp.line}) → \`${exportName}\`\n`;
+        if (!exportsByFile.has(relFilePath)) {
+            exportsByFile.set(relFilePath, []);
+        }
+        exportsByFile.get(relFilePath)!.push({ 
+            exportInfo: exp, 
+            line: exp.line 
+        });
     });
-    md += "\n*Note: This list includes exports not found in static imports within the project. They might be used dynamically, implicitly (e.g., Next.js page props), by external projects, or are genuinely unused.*\n";
+    
+    // Sort files for readability
+    const sortedFiles = Array.from(exportsByFile.keys()).sort();
+    
+    sortedFiles.forEach(filePath => {
+        const exports = exportsByFile.get(filePath)!;
+        
+        // Sort exports by line number
+        exports.sort((a, b) => a.line - b.line);
+        
+        // Get the line number to display (use the first export's line number)
+        const lineNumber = exports[0].line;
+        
+        // Start with the file path
+        md += `- \`${filePath}\` (Line ${lineNumber}) → \n`;
+        
+        // Add each export on a new line with indentation
+        exports.forEach(({ exportInfo }) => {
+            const exportName = exportInfo.isDefault ? 
+                `${exportInfo.name}${exportInfo.localName ? `: ${exportInfo.localName}` : ''}` : 
+                exportInfo.name;
+            md += `  ${exportName}\n`;
+        });
+        
+        // Add a blank line after each file's exports
+        md += '\n';
+    });
+
+    md += "*Note: This list includes exports not found in static imports within the project. This includes:*\n\n";
+    md += "1. *Some exports that the extension doesn't recognize as being used by the framework. The extension attempts to identify:*\n";
+    md += "   - *Next.js page components (default exports from `page.tsx` files)*\n";
+    md += "   - *Next.js route handlers (HTTP methods in `route.ts` files)*\n";
+    md += "   - *Next.js layout components (default exports from `layout.tsx` files)*\n";
+    md += "   - *Server actions (exports from `actions/` directory or marked with 'use server')*\n";
+    md += "   - *Special Next.js exports like `generateMetadata`, `getStaticProps`, etc.*\n";
+    md += "2. *Exports used through dynamic imports or runtime resolution*\n";
+    md += "3. *Exports only used in external projects*\n";
+    md += "4. *Genuinely unused exports that could be removed*\n\n";
+    md += "*If you believe an export is incorrectly listed here, it may be using a pattern not yet recognized by the extension.*\n";
     return md;
 }
 
@@ -531,11 +915,85 @@ function generateRoutesMarkdown(analysisResult: AnalysisResult): string {
     if (apiRoutes.length > 0) {
         md += '## API Routes (`route.*`)\n';
         apiRoutes.forEach(route => {
-            md += `- \`${route.routePath}\` → \`${route.filePath}\`\n`;
+            md += `- \`${route.routePath}\` → \`${route.filePath}\``;
+            
+            // Add exported HTTP methods if available
+            if (route.exportedMethods && route.exportedMethods.length > 0) {
+                md += ` (Methods: ${route.exportedMethods.join(', ')})`;
+            }
+            md += '\n';
+            
+            // Add usage information if available
+            if (route.usedIn && route.usedIn.length > 0) {
+                md += `  - **Used in:**\n`;
+                route.usedIn.forEach(usage => {
+                    let usageText = '';
+                    switch (usage.usageType) {
+                        case 'fetch':
+                            usageText = `fetch call with method ${usage.method || 'GET'}`;
+                            break;
+                        default:
+                            usageText = usage.usageType;
+                    }
+                    md += `    - \`${usage.sourceFile}\` (Line ${usage.line}): ${usageText}\n`;
+                });
+            }
         });
         md += '\n';
     }
-     md += "\n*Note: Route paths are derived from the directory structure within `app/` or `src/app/`, ignoring route groups `(...)`.*\n";
+    
+    // Add server actions section
+    if (analysisResult.serverActions && analysisResult.serverActions.length > 0) {
+        md += '## Server Actions\n';
+        analysisResult.serverActions.forEach(action => {
+            md += `- \`${action.name}\` → \`${action.filePath}\` (Line ${action.line})\n`;
+            
+            // Add usage information if available
+            if (action.usedIn && action.usedIn.length > 0) {
+                md += `  - **Used in:**\n`;
+                action.usedIn.forEach(usage => {
+                    let usageText = '';
+                    switch (usage.usageType) {
+                        case 'form-action':
+                            usageText = 'form action';
+                            break;
+                        default:
+                            usageText = usage.usageType;
+                    }
+                    md += `    - \`${usage.sourceFile}\` (Line ${usage.line}): ${usageText}\n`;
+                });
+            }
+        });
+        md += '\n';
+    }
+    
+    // Add hooks section
+    if (analysisResult.hooks && analysisResult.hooks.length > 0) {
+        md += '## Custom Hooks\n';
+        analysisResult.hooks.forEach(hook => {
+            md += `- \`${hook.name}\` → \`${hook.filePath}\` (Line ${hook.line})\n`;
+            
+            // Add usage information if available
+            if (hook.usedIn && hook.usedIn.length > 0) {
+                md += `  - **Used in:**\n`;
+                hook.usedIn.forEach(usage => {
+                    let usageText = '';
+                    switch (usage.usageType) {
+                        case 'hook-call':
+                            usageText = 'hook call';
+                            break;
+                        default:
+                            usageText = usage.usageType;
+                    }
+                    md += `    - \`${usage.sourceFile}\` (Line ${usage.line}): ${usageText}\n`;
+                });
+            }
+        });
+        md += '\n';
+    }
+    
+    md += "\n*Note: Route paths are derived from the directory structure within `app/` or `src/app/`, ignoring route groups `(...)`.*\n";
+    md += "*Usage information is detected from fetch calls, form actions, and hook calls throughout the codebase.*\n";
     return md;
 }
 
@@ -573,10 +1031,20 @@ export async function updateDependencyReports(workspacePath: string) {
         }
 
         // 2. Parse Files
-        const { allExports, allImports, allInterfaces, allPotentialUsage, routes, parseErrors } = parseProject(files, workspacePath);
+        const { allExports, allImports, allInterfaces, allPotentialUsage, routes, serverActions, hooks, dynamicUsages, parseErrors } = parseProject(files, workspacePath);
 
         // 3. Analyze Dependencies (Now uses improved resolution)
-        const analysisResult = analyzeDependencies(allExports, allImports, allInterfaces, allPotentialUsage, routes, workspacePath);
+        const analysisResult = analyzeDependencies(
+            allExports, 
+            allImports, 
+            allInterfaces, 
+            allPotentialUsage, 
+            routes, 
+            serverActions, 
+            hooks, 
+            dynamicUsages, 
+            workspacePath
+        );
         analysisResult.errors.push(...parseErrors); // Combine parsing errors with analysis errors
 
         if (analysisResult.errors.length > 0) {
@@ -608,4 +1076,10 @@ export async function updateDependencyReports(workspacePath: string) {
     } finally {
         isRunning = false;
     }
+}
+
+// Add cache clearing function
+export function clearAnalysisCache() {
+    moduleResolutionCache.clear();
+    clearTsConfigCache();
 }

@@ -3,11 +3,13 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { updateDependencyReports } from './dependencyService';
 import { log, logError, debounce, getConfig, getWorkspacePath, getOutputChannel } from './utils'; // Removed relativePath, not used here
+import { findProjectFilesWithRetry } from './fileFinder'; // Add this import
 
 let pollingInterval: NodeJS.Timeout | null = null;
 let debouncedUpdate: (() => void) | null = null;
 let isInitialScanComplete = false; // Flag to control save listener activation
 let saveListenerDisposable: vscode.Disposable | null = null;
+let statusBarItem: vscode.StatusBarItem;
 
 /** Main activation function */
 export function activate(context: vscode.ExtensionContext) {
@@ -17,7 +19,6 @@ export function activate(context: vscode.ExtensionContext) {
 
     // --- Register Command ---
     let disposableCommand = vscode.commands.registerCommand('next-dependency-tracker.updateDependencies', async () => {
-        log("Manual update/scan command triggered.");
         const workspacePath = getWorkspacePath();
         if (!workspacePath) {
             return;
@@ -26,18 +27,40 @@ export function activate(context: vscode.ExtensionContext) {
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: "Dependency Tracker: Scanning project...",
-            cancellable: false
-        }, async (progress) => {
-            progress.report({ increment: 0, message: "Starting analysis..." });
+            cancellable: true
+        }, async (progress, token) => {
             try {
+                token.onCancellationRequested(() => {
+                    statusBarItem.text = "$(sync) Dependencies";
+                });
+
+                statusBarItem.text = "$(sync~spin) Analyzing...";
+
+                progress.report({ increment: 0, message: "Finding files..." });
+                const { files, error: findError } = await findProjectFilesWithRetry();
+                
+                if (token.isCancellationRequested) {
+                    return;
+                }
+                
+                if (findError) {
+                    logError(`File finding failed: ${findError}. Analysis might be incomplete.`);
+                    if (!files.length) {
+                        vscode.window.showErrorMessage(`Dependency Tracker: Could not find project files. ${findError}`);
+                        return;
+                    }
+                }
+
+                progress.report({ increment: 30, message: "Analyzing dependencies..." });
                 await updateDependencyReports(workspacePath);
-                progress.report({ increment: 100, message: "Analysis complete." });
-                log("Scan complete. Enabling save listener.");
-                isInitialScanComplete = true; // Enable save listener AFTER successful scan
-                setupSaveListener(context); // Ensure listener is registered/updated
+                
+                progress.report({ increment: 100, message: "Analysis complete" });
+                statusBarItem.text = "$(sync) Dependencies";
             } catch (error) {
-                 logError("Error during scan command execution", error);
-                 progress.report({ increment: 100, message: "Analysis failed." });
+                statusBarItem.text = "$(error) Dependency Error";
+                logError("Error during dependency analysis", error);
+                vscode.window.showErrorMessage("Dependency Tracker: Analysis failed. Check output for details.");
+                throw error;
             }
         });
     });
@@ -129,8 +152,36 @@ export function activate(context: vscode.ExtensionContext) {
             log("User skipped initial scan via activation notification. Run command manually later.");
         }
     });
+
+    // Add status bar item
+    const statusBar = createStatusBarItem();
+    context.subscriptions.push(statusBar);
+
+    // Add configuration validation
+    validateConfiguration();
 }
 
+function createStatusBarItem() {
+    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right);
+    statusBarItem.text = "$(sync) Dependencies";
+    statusBarItem.command = 'next-dependency-tracker.updateDependencies';
+    statusBarItem.show();
+    return statusBarItem;
+}
+
+function validateConfiguration() {
+    const excludedFolders = getConfig<string[]>('excludedFolders');
+    if (excludedFolders !== undefined && !Array.isArray(excludedFolders)) {
+        vscode.window.showWarningMessage('Invalid excludedFolders configuration');
+    }
+
+    const debounceDelay = getConfig<number>('debounceDelayMs');
+    if (debounceDelay !== undefined && (typeof debounceDelay !== 'number' || debounceDelay < 500)) {
+        vscode.window.showWarningMessage('Invalid debounceDelayMs configuration (minimum 500ms)');
+    }
+
+    // ... other validations ...
+}
 
 /** Sets up or replaces the file save listener. */
 function setupSaveListener(context: vscode.ExtensionContext) {

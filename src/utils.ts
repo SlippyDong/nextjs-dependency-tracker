@@ -66,17 +66,56 @@ export function getWorkspacePath(): string | null {
     return null;
 }
 
-/** Gets a configuration value from settings.json. */
+/** Gets a configuration value from settings.json with type validation. */
 export function getConfig<T>(key: string): T | undefined {
     const config = vscode.workspace.getConfiguration('nextjs-dependency-tracker');
     const shortKey = key.replace('nextjs-dependency-tracker.', '');
-    return config.get<T>(shortKey);
+    const value = config.get<T>(shortKey);
+
+    // Type validation based on key
+    switch (shortKey) {
+        case 'excludedFolders':
+            if (value !== undefined && !Array.isArray(value)) {
+                logError(`Configuration error: ${shortKey} must be an array`);
+                return undefined;
+            }
+            break;
+        case 'debounceDelayMs':
+        case 'pollingIntervalSeconds':
+            if (value !== undefined && typeof value !== 'number') {
+                logError(`Configuration error: ${shortKey} must be a number`);
+                return undefined;
+            }
+            break;
+        case 'enablePolling':
+            if (value !== undefined && typeof value !== 'boolean') {
+                logError(`Configuration error: ${shortKey} must be a boolean`);
+                return undefined;
+            }
+            break;
+    }
+
+    return value;
+}
+
+/** Sanitizes a path to prevent directory traversal attacks. */
+export function sanitizePath(inputPath: string): string {
+    // Normalize path and remove any attempts to traverse up
+    const normalized = path.normalize(inputPath).replace(/^(\.\.[\/\\])+/, '');
+    
+    // Additional security: ensure path doesn't contain suspicious patterns
+    if (normalized.includes('\0') || normalized.includes('..')) {
+        throw new Error('Invalid path detected');
+    }
+    
+    return normalized;
 }
 
 /** Converts an absolute path to a path relative to the workspace root. */
 export function relativePath(absPath: string, workspacePath: string | null): string {
     if (!workspacePath) {
-        return absPath;
+        return sanitizePath(absPath);
     }
-    return path.relative(workspacePath, absPath).replace(/\\/g, '/'); // Use forward slashes
+    return path.relative(sanitizePath(workspacePath), sanitizePath(absPath))
+        .replace(/\\/g, '/');
 }

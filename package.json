@@ -4,8 +4,13 @@
   "description": "Tracks dependencies, exports, routes, and interfaces in Next.js/TS/JS projects.",
   "version": "0.0.1",
   "publisher": "SlippyDong",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SlippyDong/nextjs-dependency-tracker.git"
+  },
+  "icon": "images/icon.png",
   "engines": {
-    "vscode": "^1.98.0"
+    "vscode": "^1.90.0"
   },
   "categories": [
     "Other"

@@ -3,8 +3,11 @@ import * as vscode from 'vscode';
 import { log, logError, getConfig, getWorkspacePath } from './utils';
 import { FileFinderResult } from './types';
 import * as path from 'path';
+import * as fs from 'fs';
 
 const RELEVANT_EXTENSIONS = '{ts,tsx,js,jsx}';
+const MAX_FILE_SIZE = 1024 * 1024; // 1MB
+const MAX_FILES = 10000;
 
 /** Finds relevant project files using VS Code's findFiles API. */
 export async function findProjectFiles(): Promise<FileFinderResult> {
@@ -75,4 +78,43 @@ export async function findProjectFiles(): Promise<FileFinderResult> {
         logError(errMsg, error);
         return { files: [], error: errMsg };
     }
+}
+
+export async function findProjectFilesWithRetry(): Promise<FileFinderResult> {
+    const maxRetries = 3;
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            const result = await findProjectFiles();
+            
+            // Apply resource limits
+            if (result.files.length > MAX_FILES) {
+                return {
+                    files: [],
+                    error: `Too many files found (${result.files.length}). Maximum is ${MAX_FILES}.`
+                };
+            }
+
+            // Check file sizes
+            const oversizedFiles = await Promise.all(
+                result.files.map(async file => {
+                    const stats = await fs.promises.stat(file);
+                    return stats.size > MAX_FILE_SIZE ? file : null;
+                })
+            );
+
+            const largeFiles = oversizedFiles.filter((f): f is string => f !== null);
+            if (largeFiles.length > 0) {
+                return {
+                    files: [],
+                    error: `Files exceeding size limit (${MAX_FILE_SIZE} bytes): ${largeFiles.join(', ')}`
+                };
+            }
+
+            return result;
+        } catch (error) {
+            if (i === maxRetries - 1) {throw error;}
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+    }
+    throw new Error('Unexpected error in retry logic');
 }
