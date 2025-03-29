@@ -40,7 +40,7 @@ The extension is currently NOT directly available from the VS Code Marketplace.
 
 To install from a .vsix file:
 
-1. Download the .vsix file from the [GitHub releases page](https://github.com/SlippyDong/nextjs-dependency-tracker.git/releases)
+1. Download the .vsix file from the [GitHub releases page](https://github.com/SlippyDong/nextjs-dependency-tracker/releases/)
 2. In VS Code, go to Extensions (Ctrl+Shift+P)
 3. Search and select: "Extensions: Install from VSIX
 4. Navigate to the downloaded .vsix file and open it
